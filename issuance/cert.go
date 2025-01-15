@@ -9,6 +9,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/asn1"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math/big"
@@ -21,6 +22,7 @@ import (
 	"github.com/jmhodges/clock"
 	"github.com/zmap/zlint/v3/lint"
 
+	"github.com/letsencrypt/boulder/cmd"
 	"github.com/letsencrypt/boulder/config"
 	"github.com/letsencrypt/boulder/linter"
 	"github.com/letsencrypt/boulder/precert"
@@ -28,13 +30,43 @@ import (
 
 // ProfileConfig describes the certificate issuance constraints for all issuers.
 type ProfileConfig struct {
+	// AllowMustStaple, when false, causes all IssuanceRequests which specify the
+	// OCSP Must Staple extension to be rejected.
 	AllowMustStaple bool
-	AllowCTPoison   bool
-	AllowSCTList    bool
+	// AllowCTPoison has no effect.
+	// Deprecated: We will always allow the CT Poison extension because it is
+	// mandated for Precertificates.
+	AllowCTPoison bool
+	// AllowSCTList has no effect.
+	// Deprecated: We intend to include SCTs in all final Certificates for the
+	// foreseeable future.
+	AllowSCTList bool
+	// AllowCommonName has no effect.
+	// Deprecated: Rather than rejecting IssuanceRequests which include a common
+	// name, we would prefer to simply drop the CN. Use `OmitCommonName` instead.
 	AllowCommonName bool
+
+	// OmitCommonName causes the CN field to be excluded from the resulting
+	// certificate, regardless of its inclusion in the IssuanceRequest.
+	OmitCommonName bool
+	// OmitKeyEncipherment causes the keyEncipherment bit to be omitted from the
+	// Key Usage field of all certificates (instead of only from ECDSA certs).
+	OmitKeyEncipherment bool
+	// OmitClientAuth causes the id-kp-clientAuth OID (TLS Client Authentication)
+	// to be omitted from the EKU extension.
+	OmitClientAuth bool
+	// OmitSKID causes the Subject Key Identifier extension to be omitted.
+	OmitSKID bool
 
 	MaxValidityPeriod   config.Duration
 	MaxValidityBackdate config.Duration
+
+	// LintConfig is a path to a zlint config file, which can be used to control
+	// the behavior of zlint's "customizable lints".
+	LintConfig string
+	// IgnoredLints is a list of lint names that we know will fail for this
+	// profile, and which we know it is safe to ignore.
+	IgnoredLints []string
 
 	// Deprecated: we do not respect this field.
 	Policies []PolicyConfig `validate:"-"`
@@ -47,10 +79,11 @@ type PolicyConfig struct {
 
 // Profile is the validated structure created by reading in ProfileConfigs and IssuerConfigs
 type Profile struct {
-	allowMustStaple bool
-	allowCTPoison   bool
-	allowSCTList    bool
-	allowCommonName bool
+	allowMustStaple     bool
+	omitCommonName      bool
+	omitKeyEncipherment bool
+	omitClientAuth      bool
+	omitSKID            bool
 
 	maxBackdate time.Duration
 	maxValidity time.Duration
@@ -58,44 +91,69 @@ type Profile struct {
 	lints lint.Registry
 }
 
-// NewProfile synthesizes the profile config and issuer config into a single
-// object, and checks various aspects for correctness.
-func NewProfile(profileConfig ProfileConfig, skipLints []string) (*Profile, error) {
-	reg, err := linter.NewRegistry(skipLints)
-	if err != nil {
-		return nil, fmt.Errorf("creating lint registry: %w", err)
+// NewProfile converts the profile config into a usable profile.
+func NewProfile(profileConfig *ProfileConfig) (*Profile, error) {
+	// The Baseline Requirements, Section 7.1.2.7, says that the notBefore time
+	// must be "within 48 hours of the time of signing". We can be even stricter.
+	if profileConfig.MaxValidityBackdate.Duration >= 24*time.Hour {
+		return nil, fmt.Errorf("backdate %q is too large", profileConfig.MaxValidityBackdate.Duration)
+	}
+
+	// Our CP/CPS, Section 7.1, says that our Subscriber Certificates have a
+	// validity period of "up to 100 days".
+	if profileConfig.MaxValidityPeriod.Duration >= 100*24*time.Hour {
+		return nil, fmt.Errorf("validity period %q is too large", profileConfig.MaxValidityPeriod.Duration)
+	}
+
+	lints, err := linter.NewRegistry(profileConfig.IgnoredLints)
+	cmd.FailOnError(err, "Failed to create zlint registry")
+	if profileConfig.LintConfig != "" {
+		lintconfig, err := lint.NewConfigFromFile(profileConfig.LintConfig)
+		cmd.FailOnError(err, "Failed to load zlint config file")
+		lints.SetConfiguration(lintconfig)
 	}
 
 	sp := &Profile{
-		allowMustStaple: profileConfig.AllowMustStaple,
-		allowCTPoison:   profileConfig.AllowCTPoison,
-		allowSCTList:    profileConfig.AllowSCTList,
-		allowCommonName: profileConfig.AllowCommonName,
-		maxBackdate:     profileConfig.MaxValidityBackdate.Duration,
-		maxValidity:     profileConfig.MaxValidityPeriod.Duration,
-		lints:           reg,
+		allowMustStaple:     profileConfig.AllowMustStaple,
+		omitCommonName:      profileConfig.OmitCommonName,
+		omitKeyEncipherment: profileConfig.OmitKeyEncipherment,
+		omitClientAuth:      profileConfig.OmitClientAuth,
+		omitSKID:            profileConfig.OmitSKID,
+		maxBackdate:         profileConfig.MaxValidityBackdate.Duration,
+		maxValidity:         profileConfig.MaxValidityPeriod.Duration,
+		lints:               lints,
 	}
 
 	return sp, nil
 }
 
+// GenerateValidity returns a notBefore/notAfter pair bracketing the input time,
+// based on the profile's configured backdate and validity.
+func (p *Profile) GenerateValidity(now time.Time) (time.Time, time.Time) {
+	// Don't use the full maxBackdate, to ensure that the actual backdate remains
+	// acceptable throughout the rest of the issuance process.
+	backdate := time.Duration(float64(p.maxBackdate.Nanoseconds()) * 0.9)
+	notBefore := now.Add(-1 * backdate)
+	// Subtract one second, because certificate validity periods are *inclusive*
+	// of their final second (Baseline Requirements, Section 1.6.1).
+	notAfter := notBefore.Add(p.maxValidity).Add(-1 * time.Second)
+	return notBefore, notAfter
+}
+
 // requestValid verifies the passed IssuanceRequest against the profile. If the
 // request doesn't match the signing profile an error is returned.
 func (i *Issuer) requestValid(clk clock.Clock, prof *Profile, req *IssuanceRequest) error {
-	switch req.PublicKey.(type) {
-	case *rsa.PublicKey:
-		if !i.useForRSALeaves {
-			return errors.New("cannot sign RSA public keys")
-		}
-	case *ecdsa.PublicKey:
-		if !i.useForECDSALeaves {
-			return errors.New("cannot sign ECDSA public keys")
-		}
+	switch req.PublicKey.PublicKey.(type) {
+	case *rsa.PublicKey, *ecdsa.PublicKey:
 	default:
 		return errors.New("unsupported public key type")
 	}
 
-	if len(req.SubjectKeyId) != 20 {
+	if len(req.precertDER) == 0 && !i.active {
+		return errors.New("inactive issuer cannot issue precert")
+	}
+
+	if len(req.SubjectKeyId) != 0 && len(req.SubjectKeyId) != 20 {
 		return errors.New("unexpected subject key ID length")
 	}
 
@@ -103,20 +161,8 @@ func (i *Issuer) requestValid(clk clock.Clock, prof *Profile, req *IssuanceReque
 		return errors.New("must-staple extension cannot be included")
 	}
 
-	if !prof.allowCTPoison && req.IncludeCTPoison {
-		return errors.New("ct poison extension cannot be included")
-	}
-
-	if !prof.allowSCTList && req.sctList != nil {
-		return errors.New("sct list extension cannot be included")
-	}
-
 	if req.IncludeCTPoison && req.sctList != nil {
 		return errors.New("cannot include both ct poison and sct list extensions")
-	}
-
-	if !prof.allowCommonName && req.CommonName != "" {
-		return errors.New("common name cannot be included")
 	}
 
 	// The validity period is calculated inclusive of the whole second represented
@@ -148,11 +194,7 @@ func (i *Issuer) requestValid(clk clock.Clock, prof *Profile, req *IssuanceReque
 
 func (i *Issuer) generateTemplate() *x509.Certificate {
 	template := &x509.Certificate{
-		SignatureAlgorithm: i.sigAlg,
-		ExtKeyUsage: []x509.ExtKeyUsage{
-			x509.ExtKeyUsageServerAuth,
-			x509.ExtKeyUsageClientAuth,
-		},
+		SignatureAlgorithm:    i.sigAlg,
 		OCSPServer:            []string{i.ocspURL},
 		IssuingCertificateURL: []string{i.issuerURL},
 		BasicConstraintsValid: true,
@@ -209,12 +251,36 @@ var mustStapleExt = pkix.Extension{
 	Value: []byte{0x30, 0x03, 0x02, 0x01, 0x05},
 }
 
-// IssuanceRequest describes a certificate issuance request
-type IssuanceRequest struct {
-	PublicKey    crypto.PublicKey
-	SubjectKeyId []byte
+// MarshalablePublicKey is a wrapper for crypto.PublicKey with a custom JSON
+// marshaller that encodes the public key as a DER-encoded SubjectPublicKeyInfo.
+type MarshalablePublicKey struct {
+	crypto.PublicKey
+}
 
-	Serial []byte
+func (pk MarshalablePublicKey) MarshalJSON() ([]byte, error) {
+	keyDER, err := x509.MarshalPKIXPublicKey(pk.PublicKey)
+	if err != nil {
+		return nil, err
+	}
+	return json.Marshal(keyDER)
+}
+
+type HexMarshalableBytes []byte
+
+func (h HexMarshalableBytes) MarshalJSON() ([]byte, error) {
+	return json.Marshal(fmt.Sprintf("%x", h))
+}
+
+// IssuanceRequest describes a certificate issuance request
+//
+// It can be marshaled as JSON for logging purposes, though note that sctList and precertDER
+// will be omitted from the marshaled output because they are unexported.
+type IssuanceRequest struct {
+	// PublicKey is of type MarshalablePublicKey so we can log an IssuanceRequest as a JSON object.
+	PublicKey    MarshalablePublicKey
+	SubjectKeyId HexMarshalableBytes
+
+	Serial HexMarshalableBytes
 
 	NotBefore time.Time
 	NotAfter  time.Time
@@ -242,7 +308,7 @@ type IssuanceRequest struct {
 type issuanceToken struct {
 	mu       sync.Mutex
 	template *x509.Certificate
-	pubKey   any
+	pubKey   MarshalablePublicKey
 	// A pointer to the issuer that created this token. This token may only
 	// be redeemed by the same issuer.
 	issuer *Issuer
@@ -264,22 +330,39 @@ func (i *Issuer) Prepare(prof *Profile, req *IssuanceRequest) ([]byte, *issuance
 	// generate template from the issuer's data
 	template := i.generateTemplate()
 
+	ekus := []x509.ExtKeyUsage{
+		x509.ExtKeyUsageServerAuth,
+		x509.ExtKeyUsageClientAuth,
+	}
+	if prof.omitClientAuth {
+		ekus = []x509.ExtKeyUsage{
+			x509.ExtKeyUsageServerAuth,
+		}
+	}
+	template.ExtKeyUsage = ekus
+
 	// populate template from the issuance request
 	template.NotBefore, template.NotAfter = req.NotBefore, req.NotAfter
 	template.SerialNumber = big.NewInt(0).SetBytes(req.Serial)
-	if req.CommonName != "" {
+	if req.CommonName != "" && !prof.omitCommonName {
 		template.Subject.CommonName = req.CommonName
 	}
 	template.DNSNames = req.DNSNames
 
-	switch req.PublicKey.(type) {
+	switch req.PublicKey.PublicKey.(type) {
 	case *rsa.PublicKey:
-		template.KeyUsage = x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment
+		if prof.omitKeyEncipherment {
+			template.KeyUsage = x509.KeyUsageDigitalSignature
+		} else {
+			template.KeyUsage = x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment
+		}
 	case *ecdsa.PublicKey:
 		template.KeyUsage = x509.KeyUsageDigitalSignature
 	}
 
-	template.SubjectKeyId = req.SubjectKeyId
+	if !prof.omitSKID {
+		template.SubjectKeyId = req.SubjectKeyId
+	}
 
 	if req.IncludeCTPoison {
 		template.ExtraExtensions = append(template.ExtraExtensions, ctPoisonExt)
@@ -302,7 +385,7 @@ func (i *Issuer) Prepare(prof *Profile, req *IssuanceRequest) ([]byte, *issuance
 
 	// check that the tbsCertificate is properly formed by signing it
 	// with a throwaway key and then linting it using zlint
-	lintCertBytes, err := i.Linter.Check(template, req.PublicKey, prof.lints)
+	lintCertBytes, err := i.Linter.Check(template, req.PublicKey.PublicKey, prof.lints)
 	if err != nil {
 		return nil, nil, fmt.Errorf("tbsCertificate linting failed: %w", err)
 	}
@@ -337,7 +420,7 @@ func (i *Issuer) Issue(token *issuanceToken) ([]byte, error) {
 		return nil, errors.New("tried to redeem issuance token with the wrong issuer")
 	}
 
-	return x509.CreateCertificate(rand.Reader, template, i.Cert.Certificate, token.pubKey, i.Signer)
+	return x509.CreateCertificate(rand.Reader, template, i.Cert.Certificate, token.pubKey.PublicKey, i.Signer)
 }
 
 // ContainsMustStaple returns true if the provided set of extensions includes
@@ -372,7 +455,7 @@ func RequestFromPrecert(precert *x509.Certificate, scts []ct.SignedCertificateTi
 		return nil, errors.New("provided certificate doesn't contain the CT poison extension")
 	}
 	return &IssuanceRequest{
-		PublicKey:         precert.PublicKey,
+		PublicKey:         MarshalablePublicKey{precert.PublicKey},
 		SubjectKeyId:      precert.SubjectKeyId,
 		Serial:            precert.SerialNumber.Bytes(),
 		NotBefore:         precert.NotBefore,

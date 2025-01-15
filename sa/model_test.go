@@ -10,18 +10,17 @@ import (
 	"encoding/base64"
 	"fmt"
 	"math/big"
-	"net"
 	"os"
 	"testing"
 	"time"
 
 	"github.com/jmhodges/clock"
+	"google.golang.org/protobuf/types/known/timestamppb"
+
 	"github.com/letsencrypt/boulder/db"
-	"github.com/letsencrypt/boulder/features"
 	"github.com/letsencrypt/boulder/grpc"
 	"github.com/letsencrypt/boulder/probs"
 	"github.com/letsencrypt/boulder/test/vars"
-	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"github.com/letsencrypt/boulder/core"
 	corepb "github.com/letsencrypt/boulder/core/proto"
@@ -35,19 +34,11 @@ func TestRegistrationModelToPb(t *testing.T) {
 	}{
 		{
 			name:  "No ID",
-			input: regModel{ID: 0, Key: []byte("foo"), InitialIP: []byte("foo")},
+			input: regModel{ID: 0, Key: []byte("foo")},
 		},
 		{
 			name:  "No Key",
-			input: regModel{ID: 1, Key: nil, InitialIP: []byte("foo")},
-		},
-		{
-			name:  "No IP",
-			input: regModel{ID: 1, Key: []byte("foo"), InitialIP: nil},
-		},
-		{
-			name:  "Bad IP",
-			input: regModel{ID: 1, Key: []byte("foo"), InitialIP: []byte("foo")},
+			input: regModel{ID: 1, Key: nil},
 		},
 	}
 	for _, tc := range badCases {
@@ -57,9 +48,7 @@ func TestRegistrationModelToPb(t *testing.T) {
 		})
 	}
 
-	_, err := registrationModelToPb(&regModel{
-		ID: 1, Key: []byte("foo"), InitialIP: net.ParseIP("1.2.3.4"),
-	})
+	_, err := registrationModelToPb(&regModel{ID: 1, Key: []byte("foo")})
 	test.AssertNotError(t, err, "Should pass")
 }
 
@@ -71,7 +60,7 @@ func TestAuthzModel(t *testing.T) {
 	expires := now.Add(24 * time.Hour)
 	authzPB := &corepb.Authorization{
 		Id:             "1",
-		Identifier:     "example.com",
+		DnsName:        "example.com",
 		RegistrationID: 1,
 		Status:         string(core.StatusValid),
 		Expires:        timestamppb.New(expires),
@@ -117,7 +106,7 @@ func TestAuthzModel(t *testing.T) {
 	expires = now.Add(24 * time.Hour)
 	authzPB = &corepb.Authorization{
 		Id:             "1",
-		Identifier:     "example.com",
+		DnsName:        "example.com",
 		RegistrationID: 1,
 		Status:         string(core.StatusValid),
 		Expires:        timestamppb.New(expires),
@@ -168,7 +157,7 @@ func TestAuthzModel(t *testing.T) {
 	expires = now.Add(24 * time.Hour)
 	authzPB = &corepb.Authorization{
 		Id:             "1",
-		Identifier:     "example.com",
+		DnsName:        "example.com",
 		RegistrationID: 1,
 		Status:         string(core.StatusInvalid),
 		Expires:        timestamppb.New(expires),
@@ -209,7 +198,7 @@ func TestAuthzModel(t *testing.T) {
 	expires = now.Add(24 * time.Hour)
 	authzPB = &corepb.Authorization{
 		Id:             "1",
-		Identifier:     "example.com",
+		DnsName:        "example.com",
 		RegistrationID: 1,
 		Status:         string(core.StatusValid),
 		Expires:        timestamppb.New(expires),
@@ -248,13 +237,48 @@ func TestAuthzModel(t *testing.T) {
 // validation error JSON field to an Order produces the expected bad JSON error.
 func TestModelToOrderBadJSON(t *testing.T) {
 	badJSON := []byte(`{`)
-	_, err := modelToOrder(&orderModel{
+	_, err := modelToOrderv2(&orderModelv2{
 		Error: badJSON,
 	})
-	test.AssertError(t, err, "expected error from modelToOrder")
+	test.AssertError(t, err, "expected error from modelToOrderv2")
 	var badJSONErr errBadJSON
 	test.AssertErrorWraps(t, err, &badJSONErr)
 	test.AssertEquals(t, string(badJSONErr.json), string(badJSON))
+}
+
+func TestOrderModelThereAndBackAgain(t *testing.T) {
+	clk := clock.New()
+	now := clk.Now()
+	order := &corepb.Order{
+		Id:                0,
+		RegistrationID:    2016,
+		Expires:           timestamppb.New(now.Add(24 * time.Hour)),
+		Created:           timestamppb.New(now),
+		Error:             nil,
+		CertificateSerial: "1",
+		BeganProcessing:   true,
+	}
+	model1, err := orderToModelv1(order)
+	test.AssertNotError(t, err, "orderToModelv1 should not have errored")
+	returnOrder, err := modelToOrderv1(model1)
+	test.AssertNotError(t, err, "modelToOrderv1 should not have errored")
+	test.AssertDeepEquals(t, order, returnOrder)
+
+	anotherOrder := &corepb.Order{
+		Id:                     1,
+		RegistrationID:         2024,
+		Expires:                timestamppb.New(now.Add(24 * time.Hour)),
+		Created:                timestamppb.New(now),
+		Error:                  nil,
+		CertificateSerial:      "2",
+		BeganProcessing:        true,
+		CertificateProfileName: "phljny",
+	}
+	model2, err := orderToModelv2(anotherOrder)
+	test.AssertNotError(t, err, "orderToModelv2 should not have errored")
+	returnOrder, err = modelToOrderv2(model2)
+	test.AssertNotError(t, err, "modelToOrderv2 should not have errored")
+	test.AssertDeepEquals(t, anotherOrder, returnOrder)
 }
 
 // TestPopulateAttemptedFieldsBadJSON tests that populating a challenge from an
@@ -425,9 +449,6 @@ func TestAddReplacementOrder(t *testing.T) {
 	sa, _, cleanUp := initSA(t)
 	defer cleanUp()
 
-	features.Set(features.Config{TrackReplacementCertificatesARI: true})
-	defer features.Reset()
-
 	oldCertSerial := "1234567890"
 	orderId := int64(1337)
 	orderExpires := time.Now().Add(24 * time.Hour).UTC().Truncate(time.Second)
@@ -476,9 +497,6 @@ func TestSetReplacementOrderFinalized(t *testing.T) {
 
 	sa, _, cleanUp := initSA(t)
 	defer cleanUp()
-
-	features.Set(features.Config{TrackReplacementCertificatesARI: true})
-	defer features.Reset()
 
 	oldCertSerial := "1234567890"
 	orderId := int64(1337)
