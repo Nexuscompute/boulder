@@ -11,19 +11,27 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/jmhodges/clock"
+
 	"github.com/letsencrypt/boulder/core"
 	"github.com/letsencrypt/boulder/test"
 	"github.com/letsencrypt/boulder/test/vars"
 )
 
+// crlUpdaterMu controls access to `runUpdater`, because two crl-updaters running
+// at once will result in errors trying to lease shards that are already leased.
+var crlUpdaterMu sync.Mutex
+
 // runUpdater executes the crl-updater binary with the -runOnce flag, and
 // returns when it completes.
 func runUpdater(t *testing.T, configFile string) {
 	t.Helper()
+	crlUpdaterMu.Lock()
+	defer crlUpdaterMu.Unlock()
 
 	binPath, err := filepath.Abs("bin/boulder")
 	test.AssertNotError(t, err, "computing boulder binary path")
@@ -64,7 +72,7 @@ func TestCRLPipeline(t *testing.T) {
 
 	// Confirm that the cert does not yet show up as revoked in the CRLs.
 	runUpdater(t, configFile)
-	resp, err := http.Get("http://localhost:7890/query?serial=" + serial)
+	resp, err := http.Get("http://localhost:4501/query?serial=" + serial)
 	test.AssertNotError(t, err, "s3-test-srv GET /query failed")
 	test.AssertEquals(t, resp.StatusCode, 404)
 	resp.Body.Close()
@@ -79,7 +87,7 @@ func TestCRLPipeline(t *testing.T) {
 
 	// Confirm that the cert now *does* show up in the CRLs.
 	runUpdater(t, configFile)
-	resp, err = http.Get("http://localhost:7890/query?serial=" + serial)
+	resp, err = http.Get("http://localhost:4501/query?serial=" + serial)
 	test.AssertNotError(t, err, "s3-test-srv GET /query failed")
 	test.AssertEquals(t, resp.StatusCode, 200)
 

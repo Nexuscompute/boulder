@@ -14,9 +14,10 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/letsencrypt/boulder/identifier"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+
+	"github.com/letsencrypt/boulder/identifier"
 )
 
 // ErrorType provides a coarse category for BoulderErrors.
@@ -49,8 +50,13 @@ const (
 	AlreadyRevoked
 	BadRevocationReason
 	UnsupportedContact
-	// The requesteed serial number does not exist in the `serials` table.
+	// The requested serial number does not exist in the `serials` table.
 	UnknownSerial
+	// The certificate being indicated for replacement already has a replacement
+	// order.
+	Conflict
+	// Defined in https://datatracker.ietf.org/doc/draft-aaron-acme-profiles/00/
+	InvalidProfile
 )
 
 func (ErrorType) Error() string {
@@ -176,26 +182,50 @@ func RateLimitError(retryAfter time.Duration, msg string, args ...interface{}) e
 	}
 }
 
-func DuplicateCertificateError(retryAfter time.Duration, msg string, args ...interface{}) error {
+func RegistrationsPerIPAddressError(retryAfter time.Duration, msg string, args ...interface{}) error {
 	return &BoulderError{
 		Type:       RateLimit,
-		Detail:     fmt.Sprintf(msg+": see https://letsencrypt.org/docs/duplicate-certificate-limit/", args...),
+		Detail:     fmt.Sprintf(msg+": see https://letsencrypt.org/docs/rate-limits/#new-registrations-per-ip-address", args...),
 		RetryAfter: retryAfter,
 	}
 }
 
-func FailedValidationError(retryAfter time.Duration, msg string, args ...interface{}) error {
+func RegistrationsPerIPv6RangeError(retryAfter time.Duration, msg string, args ...interface{}) error {
 	return &BoulderError{
 		Type:       RateLimit,
-		Detail:     fmt.Sprintf(msg+": see https://letsencrypt.org/docs/failed-validation-limit/", args...),
+		Detail:     fmt.Sprintf(msg+": see https://letsencrypt.org/docs/rate-limits/#new-registrations-per-ipv6-range", args...),
 		RetryAfter: retryAfter,
 	}
 }
 
-func RegistrationsPerIPError(retryAfter time.Duration, msg string, args ...interface{}) error {
+func NewOrdersPerAccountError(retryAfter time.Duration, msg string, args ...interface{}) error {
 	return &BoulderError{
 		Type:       RateLimit,
-		Detail:     fmt.Sprintf(msg+": see https://letsencrypt.org/docs/too-many-registrations-for-this-ip/", args...),
+		Detail:     fmt.Sprintf(msg+": see https://letsencrypt.org/docs/rate-limits/#new-orders-per-account", args...),
+		RetryAfter: retryAfter,
+	}
+}
+
+func CertificatesPerDomainError(retryAfter time.Duration, msg string, args ...interface{}) error {
+	return &BoulderError{
+		Type:       RateLimit,
+		Detail:     fmt.Sprintf(msg+": see https://letsencrypt.org/docs/rate-limits/#new-certificates-per-registered-domain", args...),
+		RetryAfter: retryAfter,
+	}
+}
+
+func CertificatesPerFQDNSetError(retryAfter time.Duration, msg string, args ...interface{}) error {
+	return &BoulderError{
+		Type:       RateLimit,
+		Detail:     fmt.Sprintf(msg+": see https://letsencrypt.org/docs/rate-limits/#new-certificates-per-exact-set-of-hostnames", args...),
+		RetryAfter: retryAfter,
+	}
+}
+
+func FailedAuthorizationsPerDomainPerAccountError(retryAfter time.Duration, msg string, args ...interface{}) error {
+	return &BoulderError{
+		Type:       RateLimit,
+		Detail:     fmt.Sprintf(msg+": see https://letsencrypt.org/docs/rate-limits/#authorization-failures-per-hostname-per-account", args...),
 		RetryAfter: retryAfter,
 	}
 }
@@ -254,4 +284,12 @@ func BadRevocationReasonError(reason int64) error {
 
 func UnknownSerialError() error {
 	return New(UnknownSerial, "unknown serial")
+}
+
+func ConflictError(msg string, args ...interface{}) error {
+	return New(Conflict, msg, args...)
+}
+
+func InvalidProfileError(msg string, args ...interface{}) error {
+	return New(InvalidProfile, msg, args...)
 }

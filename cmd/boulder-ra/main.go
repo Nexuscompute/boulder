@@ -3,10 +3,12 @@ package notmain
 import (
 	"context"
 	"flag"
+	"fmt"
 	"os"
 	"time"
 
 	akamaipb "github.com/letsencrypt/boulder/akamai/proto"
+	"github.com/letsencrypt/boulder/allowlist"
 	capb "github.com/letsencrypt/boulder/ca/proto"
 	"github.com/letsencrypt/boulder/cmd"
 	"github.com/letsencrypt/boulder/config"
@@ -22,7 +24,10 @@ import (
 	pubpb "github.com/letsencrypt/boulder/publisher/proto"
 	"github.com/letsencrypt/boulder/ra"
 	rapb "github.com/letsencrypt/boulder/ra/proto"
+	"github.com/letsencrypt/boulder/ratelimits"
+	bredis "github.com/letsencrypt/boulder/redis"
 	sapb "github.com/letsencrypt/boulder/sa/proto"
+	"github.com/letsencrypt/boulder/va"
 	vapb "github.com/letsencrypt/boulder/va/proto"
 )
 
@@ -31,7 +36,8 @@ type Config struct {
 		cmd.ServiceConfig
 		cmd.HostnamePolicyConfig
 
-		RateLimitPoliciesFilename string `validate:"required"`
+		// RateLimitPoliciesFilename is deprecated.
+		RateLimitPoliciesFilename string
 
 		MaxContactsPerRegistration int
 
@@ -41,6 +47,33 @@ type Config struct {
 		OCSPService         *cmd.GRPCClientConfig
 		PublisherService    *cmd.GRPCClientConfig
 		AkamaiPurgerService *cmd.GRPCClientConfig
+
+		Limiter struct {
+			// Redis contains the configuration necessary to connect to Redis
+			// for rate limiting. This field is required to enable rate
+			// limiting.
+			Redis *bredis.Config `validate:"required_with=Defaults"`
+
+			// Defaults is a path to a YAML file containing default rate limits.
+			// See: ratelimits/README.md for details. This field is required to
+			// enable rate limiting. If any individual rate limit is not set,
+			// that limit will be disabled. Limits passed in this file must be
+			// identical to those in the WFE.
+			//
+			// Note: At this time, only the Failed Authorizations rate limit is
+			// necessary in the RA.
+			Defaults string `validate:"required_with=Redis"`
+
+			// Overrides is a path to a YAML file containing overrides for the
+			// default rate limits. See: ratelimits/README.md for details. If
+			// this field is not set, all requesters will be subject to the
+			// default rate limits. Overrides passed in this file must be
+			// identical to those in the WFE.
+			//
+			// Note: At this time, only the Failed Authorizations overrides are
+			// necessary in the RA.
+			Overrides string
+		}
 
 		// MaxNames is the maximum number of subjectAltNames in a single cert.
 		// The value supplied MUST be greater than 0 and no more than 100. These
@@ -59,6 +92,25 @@ type Config struct {
 		// the pending state. If you can't respond to a challenge this quickly, then
 		// you need to request a new challenge.
 		PendingAuthorizationLifetimeDays int `validate:"required,min=1,max=29"`
+
+		// ValidationProfiles is a map of validation profiles to their
+		// respective issuance allow lists. If a profile is not included in this
+		// mapping, it cannot be used by any account. If this field is left
+		// empty, all profiles are open to all accounts.
+		ValidationProfiles map[string]struct {
+			// AllowList specifies the path to a YAML file containing a list of
+			// account IDs permitted to use this profile. If no path is
+			// specified, the profile is open to all accounts. If the file
+			// exists but is empty, the profile is closed to all accounts.
+			AllowList string `validate:"omitempty"`
+		}
+
+		// MustStapleAllowList specifies the path to a YAML file containing a
+		// list of account IDs permitted to request certificates with the OCSP
+		// Must-Staple extension. If no path is specified, the extension is
+		// permitted for all accounts. If the file exists but is empty, the
+		// extension is disabled for all accounts.
+		MustStapleAllowList string `validate:"omitempty"`
 
 		// GoodKey is an embedded config stanza for the goodkey library.
 		GoodKey goodkey.Config
@@ -221,15 +273,53 @@ func main() {
 	}
 	pendingAuthorizationLifetime := time.Duration(c.RA.PendingAuthorizationLifetimeDays) * 24 * time.Hour
 
+	var validationProfiles map[string]*ra.ValidationProfile
+	if c.RA.ValidationProfiles != nil {
+		validationProfiles = make(map[string]*ra.ValidationProfile)
+		for profileName, v := range c.RA.ValidationProfiles {
+			var allowList *allowlist.List[int64]
+			if v.AllowList != "" {
+				data, err := os.ReadFile(v.AllowList)
+				cmd.FailOnError(err, fmt.Sprintf("Failed to read allow list for profile %q", profileName))
+				allowList, err = allowlist.NewFromYAML[int64](data)
+				cmd.FailOnError(err, fmt.Sprintf("Failed to parse allow list for profile %q", profileName))
+			}
+			validationProfiles[profileName] = ra.NewValidationProfile(allowList)
+		}
+	}
+
+	var mustStapleAllowList *allowlist.List[int64]
+	if c.RA.MustStapleAllowList != "" {
+		data, err := os.ReadFile(c.RA.MustStapleAllowList)
+		cmd.FailOnError(err, "Failed to read allow list for Must-Staple extension")
+		mustStapleAllowList, err = allowlist.NewFromYAML[int64](data)
+		cmd.FailOnError(err, "Failed to parse allow list for Must-Staple extension")
+	}
+
 	if features.Get().AsyncFinalize && c.RA.FinalizeTimeout.Duration == 0 {
 		cmd.Fail("finalizeTimeout must be supplied when AsyncFinalize feature is enabled")
 	}
 
-	kp, err := sagoodkey.NewKeyPolicy(&c.RA.GoodKey, sac.KeyBlocked)
+	kp, err := sagoodkey.NewPolicy(&c.RA.GoodKey, sac.KeyBlocked)
 	cmd.FailOnError(err, "Unable to create key policy")
 
 	if c.RA.MaxNames == 0 {
 		cmd.Fail("Error in RA config: MaxNames must not be 0")
+	}
+
+	var limiter *ratelimits.Limiter
+	var txnBuilder *ratelimits.TransactionBuilder
+	var limiterRedis *bredis.Ring
+	if c.RA.Limiter.Defaults != "" {
+		// Setup rate limiting.
+		limiterRedis, err = bredis.NewRingFromConfig(*c.RA.Limiter.Redis, scope, logger)
+		cmd.FailOnError(err, "Failed to create Redis ring")
+
+		source := ratelimits.NewRedisSource(limiterRedis.Ring, clk, scope)
+		limiter, err = ratelimits.NewLimiter(clk, source, scope)
+		cmd.FailOnError(err, "Failed to create rate limiter")
+		txnBuilder, err = ratelimits.NewTransactionBuilderFromFiles(c.RA.Limiter.Defaults, c.RA.Limiter.Overrides)
+		cmd.FailOnError(err, "Failed to create rate limits transaction builder")
 	}
 
 	rai := ra.NewRegistrationAuthorityImpl(
@@ -238,24 +328,28 @@ func main() {
 		scope,
 		c.RA.MaxContactsPerRegistration,
 		kp,
+		limiter,
+		txnBuilder,
 		c.RA.MaxNames,
 		authorizationLifetime,
 		pendingAuthorizationLifetime,
+		validationProfiles,
+		mustStapleAllowList,
 		pubc,
-		caaClient,
 		c.RA.OrderLifetime.Duration,
 		c.RA.FinalizeTimeout.Duration,
 		ctp,
 		apc,
 		issuerCerts,
 	)
-	defer rai.DrainFinalize()
+	defer rai.Drain()
 
-	policyErr := rai.LoadRateLimitPoliciesFile(c.RA.RateLimitPoliciesFilename)
-	cmd.FailOnError(policyErr, "Couldn't load rate limit policies file")
 	rai.PA = pa
 
-	rai.VA = vac
+	rai.VA = va.RemoteClients{
+		VAClient:  vac,
+		CAAClient: caaClient,
+	}
 	rai.CA = cac
 	rai.OCSP = ocspc
 	rai.SA = sac

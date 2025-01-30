@@ -3,12 +3,15 @@ package notmain
 import (
 	"context"
 	"fmt"
-	"math/rand"
+	"math/rand/v2"
 	"os"
 	"sync/atomic"
 	"time"
 
 	"github.com/jmhodges/clock"
+	"golang.org/x/crypto/ocsp"
+	"google.golang.org/protobuf/types/known/timestamppb"
+
 	capb "github.com/letsencrypt/boulder/ca/proto"
 	"github.com/letsencrypt/boulder/core"
 	"github.com/letsencrypt/boulder/db"
@@ -16,8 +19,6 @@ import (
 	"github.com/letsencrypt/boulder/rocsp"
 	"github.com/letsencrypt/boulder/sa"
 	"github.com/letsencrypt/boulder/test/ocsp/helper"
-	"golang.org/x/crypto/ocsp"
-	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 type client struct {
@@ -91,7 +92,7 @@ func (cl *client) loadFromDB(ctx context.Context, speed ProcessingSpeed, startFr
 
 	results := make(chan processResult, speed.ParallelSigns)
 	var runningSigners int32
-	for i := 0; i < speed.ParallelSigns; i++ {
+	for range speed.ParallelSigns {
 		atomic.AddInt32(&runningSigners, 1)
 		go cl.signAndStoreResponses(ctx, statusesToSign, results, &runningSigners)
 	}
@@ -103,9 +104,9 @@ func (cl *client) loadFromDB(ctx context.Context, speed ProcessingSpeed, startFr
 		if result.err != nil {
 			errorCount++
 			if errorCount < 10 ||
-				(errorCount < 1000 && rand.Intn(1000) < 100) ||
-				(errorCount < 100000 && rand.Intn(1000) < 10) ||
-				(rand.Intn(1000) < 1) {
+				(errorCount < 1000 && rand.IntN(1000) < 100) ||
+				(errorCount < 100000 && rand.IntN(1000) < 10) ||
+				(rand.IntN(1000) < 1) {
 				cl.logger.Errf("error: %s", result.err)
 			}
 		} else {
@@ -114,9 +115,9 @@ func (cl *client) loadFromDB(ctx context.Context, speed ProcessingSpeed, startFr
 
 		total := successCount + errorCount
 		if total < 10 ||
-			(total < 1000 && rand.Intn(1000) < 100) ||
-			(total < 100000 && rand.Intn(1000) < 10) ||
-			(rand.Intn(1000) < 1) {
+			(total < 1000 && rand.IntN(1000) < 100) ||
+			(total < 100000 && rand.IntN(1000) < 10) ||
+			(rand.IntN(1000) < 1) {
 			cl.logger.Infof("stored %d responses, %d errors", successCount, errorCount)
 		}
 	}
@@ -169,21 +170,15 @@ func (cl *client) scanFromDBOneBatch(ctx context.Context, prevID int64, frequenc
 	if err != nil {
 		return -1, fmt.Errorf("scanning certificateStatus: %w", err)
 	}
-	defer func() {
-		rerr := rows.Close()
-		if rerr != nil {
-			cl.logger.Infof("closing rows: %s", rerr)
-		}
-	}()
 
 	var scanned int
 	var previousID int64
-	for rows.Next() {
+	err = rows.ForEach(func(row *sa.CertStatusMetadata) error {
 		<-rowTicker.C
 
 		status, err := rows.Get()
 		if err != nil {
-			return -1, fmt.Errorf("scanning row %d (previous ID %d): %w", scanned, previousID, err)
+			return fmt.Errorf("scanning row %d (previous ID %d): %w", scanned, previousID, err)
 		}
 		scanned++
 		inflightIDs.add(uint64(status.ID))
@@ -195,7 +190,12 @@ func (cl *client) scanFromDBOneBatch(ctx context.Context, prevID int64, frequenc
 		}
 		output <- status
 		previousID = status.ID
+		return nil
+	})
+	if err != nil {
+		return -1, err
 	}
+
 	return previousID, nil
 }
 

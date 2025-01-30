@@ -13,7 +13,7 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"math/rand"
+	"math/rand/v2"
 	"net/http"
 	"os"
 	"strings"
@@ -161,7 +161,7 @@ func (is *integrationSrv) addChainOrPre(w http.ResponseWriter, r *http.Request, 
 	is.submissions[hostnames]++
 	is.Unlock()
 
-	if is.flakinessRate != 0 && rand.Intn(100) < is.flakinessRate {
+	if is.flakinessRate != 0 && rand.IntN(100) < is.flakinessRate {
 		time.Sleep(10 * time.Second)
 	}
 
@@ -236,8 +236,8 @@ func runPersonality(p Personality) {
 		Handler: m,
 	}
 	logID := sha256.Sum256(pubKeyBytes)
-	log.Printf("ct-test-srv on %s with pubkey %s and log ID %s", p.Addr,
-		base64.StdEncoding.EncodeToString(pubKeyBytes), base64.StdEncoding.EncodeToString(logID[:]))
+	log.Printf("ct-test-srv on %s with pubkey: %s, log ID: %s, flakiness: %d%%", p.Addr,
+		base64.StdEncoding.EncodeToString(pubKeyBytes), base64.StdEncoding.EncodeToString(logID[:]), p.FlakinessRate)
 	log.Fatal(srv.ListenAndServe())
 }
 
